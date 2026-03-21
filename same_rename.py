@@ -1,137 +1,140 @@
 import os
 import re
-import subprocess
 import shutil
-from datetime import datetime
-from concurrent.futures import ThreadPoolExecutor, as_completed
-import numpy as np
+import subprocess
 import tempfile
+from datetime import datetime
 
 # Constants
-OVERLAP_THRESHOLD = 0.9  # Define the threshold for high overlap
-IMAGE_EXTENSIONS = ['.jpg', '.jpeg', '.png', '.tiff', '.tif']  # Supported image formats
-SEQUENCE_PREFIX = "seq_"  # Prefix to identify already renamed files
-ALIGN_PARAMS = [['--corr=0.8'], ['--corr=0.9'], ['--corr=0.7']]  # Different parameter sets for alignment
+IMAGE_EXTENSIONS = ['.jpg', '.jpeg', '.png', '.tiff', '.tif', '.webp']
+SEQUENCE_PREFIX = "seq"
 
 def is_image_file(filename):
-    """Check if the file is an image based on its extension."""
     return any(filename.lower().endswith(ext) for ext in IMAGE_EXTENSIONS)
 
 def is_already_renamed(filename):
-    """Check if the file is already renamed by the script."""
-    return re.match(f"{SEQUENCE_PREFIX}[0-9]+_", filename)
+    # Check if already starts with seq_XXX_
+    return re.match(r"^seq_\d{3}_", filename)
 
-def preserve_metadata(source, target):
-    """Preserve the creation date and time of the source file to the target file."""
-    creation_time = os.path.getmtime(source)
-    os.utime(target, (creation_time, creation_time))
+def check_similarity_align_image_stack(img1_path, img2_path):
+    """
+    Check if two images are similar using align_image_stack.
+    Returns True if they can be aligned (have enough control points), False otherwise.
+    """
+    # Create a temporary directory for output files
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        # Prefix for aligned output images - we don't actually need them,
+        # but align_image_stack requires -o or -p to run optimization.
+        # Directing the prefix to the temp directory ensures no clutter.
+        temp_output_prefix = os.path.join(tmp_dir, "align_result")
 
-def run_align_image_stack(images, params, temp_pto_path):
-    """Run align_image_stack with specified parameters and generate .pto file."""
-    command = ['align_image_stack', '-o', temp_pto_path] + params + images
-    try:
-        subprocess.run(command, capture_output=True, text=True, check=True)
-        return parse_pto_file(temp_pto_path)
-    except subprocess.CalledProcessError as e:
-        print(f"Error running align_image_stack with params {params}: {e}")
-        return []
-    except Exception as e:
-        print(f"Unexpected error running align_image_stack: {e}")
-        return []
+        # align_image_stack command:
+        # -o specifies the PTO file name.
+        # -p specifies the prefix for the remapped TIFF images.
+        # We put both in the temporary directory.
+        command = [
+            'align_image_stack',
+            '-o', f"{temp_output_prefix}.pto",
+            '-p', temp_output_prefix,
+            img1_path,
+            img2_path
+        ]
+        try:
+            # Run with a timeout to avoid hangs
+            result = subprocess.run(command, capture_output=True, text=True, timeout=60)
 
-def parse_pto_file(pto_file):
-    """Parse the .pto file to extract overlap scores based on control points."""
-    overlap_scores = []
-    try:
-        with open(pto_file, 'r') as file:
-            data = file.read()
-
-        # Regex to find control points and other relevant overlap-related data in the .pto file
-        control_point_pattern = re.compile(r'c n\d+ N\d+ x\d+ y\d+ X\d+ Y\d+ t(\d+)', re.MULTILINE)
-        control_points = control_point_pattern.findall(data)
-
-        # Calculate overlap score based on control point distribution and count
-        control_point_count = len(control_points)
-        if control_point_count > 0:
-            overlap_density = control_point_count / max(1, len(set(control_points)))  # Normalize by unique point types
-            overlap_scores.append(overlap_density)
-
-    except FileNotFoundError:
-        print(f"Error: .pto file {pto_file} not found.")
-    except Exception as e:
-        print(f"Error parsing .pto file {pto_file}: {e}")
-
-    return overlap_scores
-
-def get_overlap_ratios_parallel(images):
-    """Calculate overlap ratios using parallel execution with different parameter sets."""
-    overlap_results = []
-    with ThreadPoolExecutor(max_workers=len(ALIGN_PARAMS)) as executor:
-        # Generate unique temporary .pto file paths
-        temp_files = [tempfile.NamedTemporaryFile(delete=False, suffix=".pto") for _ in ALIGN_PARAMS]
-        temp_paths = [temp_file.name for temp_file in temp_files]
-        futures = {
-            executor.submit(run_align_image_stack, images, params, temp_path): (params, temp_path)
-            for params, temp_path in zip(ALIGN_PARAMS, temp_paths)
-        }
-        for future in as_completed(futures):
-            params, temp_path = futures[future]
-            try:
-                result = future.result()
-                if result:
-                    overlap_results.append(result)
-            except Exception as e:
-                print(f"Error with params {params}: {e}")
-            finally:
-                # Clean up temporary .pto files
-                try:
-                    os.remove(temp_path)
-                except OSError as e:
-                    print(f"Error deleting temporary file {temp_path}: {e}")
-
-    # Flatten list of overlap scores and calculate statistics
-    all_overlap_scores = [score for sublist in overlap_results for score in sublist]
-    if all_overlap_scores:
-        mean_overlap = np.mean(all_overlap_scores)
-        median_overlap = np.median(all_overlap_scores)
-        std_overlap = np.std(all_overlap_scores)
-        print(f"Mean Overlap: {mean_overlap}, Median Overlap: {median_overlap}, Std Deviation: {std_overlap}")
-        return mean_overlap, median_overlap, std_overlap
-    else:
-        print("No overlap scores found.")
-        return None, None, None
+            # If it exits with 0, it found enough control points to try optimization
+            if result.returncode == 0:
+                # Double check for "After control points pruning there are only 0 control points"
+                if "After control points pruning there are only 0 control points" in result.stderr:
+                    return False
+                return True
+            return False
+        except subprocess.TimeoutExpired:
+            print(f"Timeout checking similarity between {os.path.basename(img1_path)} and {os.path.basename(img2_path)}")
+            return False
+        except Exception as e:
+            print(f"Error running align_image_stack: {e}")
+            return False
 
 def rename_images(directory):
-    """Scan directory for images, find those with high overlap, and rename them sequentially."""
-    images = [f for f in os.listdir(directory) if is_image_file(f) and not is_already_renamed(f)]
-    images.sort(key=lambda x: os.path.getctime(os.path.join(directory, x)))  # Sort by creation time
+    # Filter and sort images by modification time
+    try:
+        all_files = os.listdir(directory)
+    except OSError as e:
+        print(f"Error listing directory {directory}: {e}")
+        return
+
+    images = [f for f in all_files if is_image_file(f) and not is_already_renamed(f)]
+    images.sort(key=lambda x: os.path.getmtime(os.path.join(directory, x)))
 
     if len(images) < 2:
         print("Not enough images to process.")
         return
 
-    # Calculate overlap ratios using parallel execution
-    mean_overlap, median_overlap, std_overlap = get_overlap_ratios_parallel([os.path.join(directory, img) for img in images])
+    print(f"Analyzing {len(images)} images in {directory} using align_image_stack...")
 
-    if mean_overlap is None or median_overlap is None:
-        print("Unable to compute valid overlap ratios.")
+    sequences = []
+    i = 0
+    while i < len(images):
+        current_img_name = images[i]
+        current_img_path = os.path.join(directory, current_img_name)
+        current_seq = [current_img_name]
+
+        j = i + 1
+        while j < len(images):
+            next_img_name = images[j]
+            next_img_path = os.path.join(directory, next_img_name)
+
+            print(f"Checking similarity: {current_img_name} vs {next_img_name}...", end=" ", flush=True)
+            is_similar = check_similarity_align_image_stack(current_img_path, next_img_path)
+
+            if is_similar:
+                print("SIMILAR")
+                current_seq.append(next_img_name)
+                # In sequences, we compare with the previous image to handle slow motion/drifts
+                current_img_path = next_img_path
+                current_img_name = next_img_name
+                j += 1
+            else:
+                print("DIFFERENT")
+                break
+
+        if len(current_seq) > 1:
+            sequences.append(current_seq)
+            i = j
+        else:
+            i += 1
+
+    if not sequences:
+        print("No sequences of similar images found.")
         return
 
-    # Determine which images have high overlap based on statistical analysis
-    high_overlap_images = [img for img in images if mean_overlap >= OVERLAP_THRESHOLD]
+    print(f"\nFound {len(sequences)} sequences.")
 
-    # Rename images preserving order and metadata
-    counter = 1
-    for img in high_overlap_images:
-        new_name = f"{SEQUENCE_PREFIX}{counter:03d}_{img}"
-        new_path = os.path.join(directory, new_name)
-        old_path = os.path.join(directory, img)
-        if old_path != new_path:
-            shutil.move(old_path, new_path)
-            preserve_metadata(old_path, new_path)
-            print(f"Renamed {img} to {new_name}")
-        counter += 1
+    for seq_idx, seq in enumerate(sequences, 1):
+        print(f"Processing sequence {seq_idx} ({len(seq)} images)...")
+        for img_idx, img_name in enumerate(seq, 1):
+            # Naming format: seq_{seq_id:03d}_{img_id:03d}_{original_name}
+            new_name = f"seq_{seq_idx:03d}_{img_idx:03d}_{img_name}"
+
+            old_path = os.path.join(directory, img_name)
+            new_path = os.path.join(directory, new_name)
+
+            if os.path.exists(new_path):
+                print(f"Warning: {new_path} already exists. Skipping {img_name}.")
+                continue
+
+            try:
+                mtime = os.path.getmtime(old_path)
+                shutil.move(old_path, new_path)
+                # Preserve modification time exactly as it was
+                os.utime(new_path, (mtime, mtime))
+                print(f"Renamed {img_name} -> {new_name}")
+            except Exception as e:
+                print(f"Error renaming {img_name}: {e}")
 
 if __name__ == "__main__":
-    directory = '.'  # Current directory
-    rename_images(directory)
+    import sys
+    target_dir = sys.argv[1] if len(sys.argv) > 1 else '.'
+    rename_images(target_dir)
