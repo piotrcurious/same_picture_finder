@@ -1,12 +1,11 @@
 import os
 import re
 import shutil
-import cv2
-import numpy as np
+import subprocess
+import tempfile
 from datetime import datetime
 
 # Constants
-SIMILARITY_THRESHOLD = 0.9  # Adjusted threshold
 IMAGE_EXTENSIONS = ['.jpg', '.jpeg', '.png', '.tiff', '.tif', '.webp']
 SEQUENCE_PREFIX = "seq"
 
@@ -17,33 +16,55 @@ def is_already_renamed(filename):
     # Check if already starts with seq_XXX_
     return re.match(r"^seq_\d{3}_", filename)
 
-def get_image_fingerprint(image_path):
-    """Generate a fingerprint of the image for similarity comparison."""
-    try:
-        img = cv2.imread(image_path)
-        if img is None:
-            return None
-        # Resize to a small fixed size and convert to grayscale
-        img = cv2.resize(img, (64, 64)) # Slightly larger for better detail
-        img = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-        # Apply slight Gaussian blur to reduce noise
-        img = cv2.GaussianBlur(img, (3, 3), 0)
-        return img
-    except Exception as e:
-        print(f"Error processing {image_path}: {e}")
-        return None
+def check_similarity_align_image_stack(img1_path, img2_path):
+    """
+    Check if two images are similar using align_image_stack.
+    Returns True if they can be aligned (have enough control points), False otherwise.
+    """
+    # Create a temporary directory for output files
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        # Prefix for aligned output images - we don't actually need them,
+        # but align_image_stack requires -o or -p to run optimization.
+        # Directing the prefix to the temp directory ensures no clutter.
+        temp_output_prefix = os.path.join(tmp_dir, "align_result")
 
-def calculate_similarity(img1, img2):
-    """Calculate structural similarity or correlation between two fingerprints."""
-    if img1 is None or img2 is None:
-        return 0
-    # Use correlation coefficient
-    res = cv2.matchTemplate(img1, img2, cv2.TM_CCOEFF_NORMED)
-    return res[0][0]
+        # align_image_stack command:
+        # -o specifies the PTO file name.
+        # -p specifies the prefix for the remapped TIFF images.
+        # We put both in the temporary directory.
+        command = [
+            'align_image_stack',
+            '-o', f"{temp_output_prefix}.pto",
+            '-p', temp_output_prefix,
+            img1_path,
+            img2_path
+        ]
+        try:
+            # Run with a timeout to avoid hangs
+            result = subprocess.run(command, capture_output=True, text=True, timeout=60)
+
+            # If it exits with 0, it found enough control points to try optimization
+            if result.returncode == 0:
+                # Double check for "After control points pruning there are only 0 control points"
+                if "After control points pruning there are only 0 control points" in result.stderr:
+                    return False
+                return True
+            return False
+        except subprocess.TimeoutExpired:
+            print(f"Timeout checking similarity between {os.path.basename(img1_path)} and {os.path.basename(img2_path)}")
+            return False
+        except Exception as e:
+            print(f"Error running align_image_stack: {e}")
+            return False
 
 def rename_images(directory):
     # Filter and sort images by modification time
-    all_files = os.listdir(directory)
+    try:
+        all_files = os.listdir(directory)
+    except OSError as e:
+        print(f"Error listing directory {directory}: {e}")
+        return
+
     images = [f for f in all_files if is_image_file(f) and not is_already_renamed(f)]
     images.sort(key=lambda x: os.path.getmtime(os.path.join(directory, x)))
 
@@ -51,38 +72,32 @@ def rename_images(directory):
         print("Not enough images to process.")
         return
 
-    print(f"Analyzing {len(images)} images in {directory}...")
-
-    fingerprints = {}
-    for img in images:
-        fp = get_image_fingerprint(os.path.join(directory, img))
-        if fp is not None:
-            fingerprints[img] = fp
-
-    valid_images = [img for img in images if img in fingerprints]
-
-    if not valid_images:
-        print("No valid images found.")
-        return
+    print(f"Analyzing {len(images)} images in {directory} using align_image_stack...")
 
     sequences = []
     i = 0
-    while i < len(valid_images):
-        current_img = valid_images[i]
-        current_seq = [current_img]
+    while i < len(images):
+        current_img_name = images[i]
+        current_img_path = os.path.join(directory, current_img_name)
+        current_seq = [current_img_name]
 
         j = i + 1
-        while j < len(valid_images):
-            next_img = valid_images[j]
-            similarity = calculate_similarity(fingerprints[current_img], fingerprints[next_img])
+        while j < len(images):
+            next_img_name = images[j]
+            next_img_path = os.path.join(directory, next_img_name)
 
-            # Use a slightly lower threshold for consecutive images in a sequence
-            # to handle gradual changes, but keep it high enough to avoid merging different scenes.
-            if similarity >= SIMILARITY_THRESHOLD:
-                current_seq.append(next_img)
-                current_img = next_img # Compare with the last added image
+            print(f"Checking similarity: {current_img_name} vs {next_img_name}...", end=" ", flush=True)
+            is_similar = check_similarity_align_image_stack(current_img_path, next_img_path)
+
+            if is_similar:
+                print("SIMILAR")
+                current_seq.append(next_img_name)
+                # In sequences, we compare with the previous image to handle slow motion/drifts
+                current_img_path = next_img_path
+                current_img_name = next_img_name
                 j += 1
             else:
+                print("DIFFERENT")
                 break
 
         if len(current_seq) > 1:
@@ -95,13 +110,12 @@ def rename_images(directory):
         print("No sequences of similar images found.")
         return
 
-    print(f"Found {len(sequences)} sequences.")
+    print(f"\nFound {len(sequences)} sequences.")
 
     for seq_idx, seq in enumerate(sequences, 1):
         print(f"Processing sequence {seq_idx} ({len(seq)} images)...")
         for img_idx, img_name in enumerate(seq, 1):
-            ext = os.path.splitext(img_name)[1]
-            # Naming format: seq_XXX_YYY_original_name.ext
+            # Naming format: seq_{seq_id:03d}_{img_id:03d}_{original_name}
             new_name = f"seq_{seq_idx:03d}_{img_idx:03d}_{img_name}"
 
             old_path = os.path.join(directory, img_name)
@@ -114,6 +128,7 @@ def rename_images(directory):
             try:
                 mtime = os.path.getmtime(old_path)
                 shutil.move(old_path, new_path)
+                # Preserve modification time exactly as it was
                 os.utime(new_path, (mtime, mtime))
                 print(f"Renamed {img_name} -> {new_name}")
             except Exception as e:
